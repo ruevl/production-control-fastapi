@@ -1,9 +1,8 @@
-"""Тесты для Batch API."""
+import pytest
 
 
+@pytest.mark.asyncio
 async def test_create_work_center_first(client, db_session):
-    """Сначала создаём рабочий центр, потом партию."""
-    # Создаём Work Center
     wc_response = await client.post(
         "/api/v1/work-centers",
         json={
@@ -16,8 +15,8 @@ async def test_create_work_center_first(client, db_session):
     assert wc_data["identifier"] == "WC_TEST_001"
 
 
+@pytest.mark.asyncio
 async def test_list_batches_empty(client):
-    """Тест списка партий когда их нет."""
     response = await client.get("/api/v1/batches")
     assert response.status_code == 200
     data = response.json()

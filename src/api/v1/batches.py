@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -25,24 +25,35 @@ from src.schemas import (
 router = APIRouter(prefix="/batches", tags=["Batches"])
 
 
+async def get_or_404(repo, entity_id: int, detail: str):
+    entity = await repo.get_by_id(entity_id)
+    if not entity:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+    return entity
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_batches(
-    batches_data: list[BatchCreate],
-    db: AsyncSession = Depends(get_db),
-    batch_repo: BatchRepository = Depends(get_batch_repository),
-    work_center_repo: WorkCenterRepository = Depends(get_work_center_repository),
+        batches_data: list[BatchCreate],
+        db: AsyncSession = Depends(get_db),
+        batch_repo: BatchRepository = Depends(get_batch_repository),
+        work_center_repo: WorkCenterRepository = Depends(get_work_center_repository),
 ) -> list[BatchResponse]:
+    work_centers = {}
+    for batch_data in batches_data:
+        identifier = batch_data.work_center_identifier
+        if identifier not in work_centers:
+            wc = await work_center_repo.get_by_identifier(identifier)
+            if not wc:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Work center '{identifier}' not found",
+                )
+            work_centers[identifier] = wc
+
     created = []
     for batch_data in batches_data:
-        work_center = await work_center_repo.get_by_identifier(
-            batch_data.work_center_identifier
-        )
-        if not work_center:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Work center '{batch_data.work_center_identifier}' not found",
-            )
-
+        work_center = work_centers[batch_data.work_center_identifier]
         batch = await batch_repo.create(
             {
                 "is_closed": batch_data.is_closed,
@@ -66,22 +77,20 @@ async def create_batches(
 
 @router.get("", response_model=BatchListResponse)
 async def list_batches(
-    db: AsyncSession = Depends(get_db),
-    batch_repo: BatchRepository = Depends(get_batch_repository),
-    is_closed: Optional[bool] = Query(None),
-    batch_number: Optional[int] = Query(None),
-    batch_date: Optional[date] = Query(None),
-    work_center_id: Optional[str] = Query(None),
-    shift: Optional[str] = Query(None),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+        db: AsyncSession = Depends(get_db),
+        batch_repo: BatchRepository = Depends(get_batch_repository),
+        work_center_repo: WorkCenterRepository = Depends(get_work_center_repository),
+        is_closed: Optional[bool] = Query(None),
+        batch_number: Optional[int] = Query(None),
+        batch_date: Optional[date] = Query(None),
+        work_center_id: Optional[str] = Query(None),
+        shift: Optional[str] = Query(None),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(20, ge=1, le=100),
 ):
     work_center_id_int = None
     if work_center_id:
-        from src.repositories.work_center_repository import WorkCenterRepository
-
-        wc_repo = WorkCenterRepository(db)
-        wc = await wc_repo.get_by_identifier(work_center_id)
+        wc = await work_center_repo.get_by_identifier(work_center_id)
         if wc:
             work_center_id_int = wc.id
 
@@ -105,15 +114,12 @@ async def list_batches(
 
 @router.get("/{batch_id}", response_model=BatchDetailResponse)
 async def get_batch(
-    batch_id: int,
-    db: AsyncSession = Depends(get_db),
-    batch_repo: BatchRepository = Depends(get_batch_repository),
+        batch_id: int,
+        batch_repo: BatchRepository = Depends(get_batch_repository),
 ):
     batch = await batch_repo.get_by_id_with_products(batch_id)
     if not batch:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found")
 
     return BatchDetailResponse.model_validate(
         {
@@ -125,24 +131,18 @@ async def get_batch(
 
 @router.patch("/{batch_id}", response_model=BatchResponse)
 async def update_batch(
-    batch_id: int,
-    batch_update: BatchUpdate,
-    db: AsyncSession = Depends(get_db),
-    batch_repo: BatchRepository = Depends(get_batch_repository),
+        batch_id: int,
+        batch_update: BatchUpdate,
+        db: AsyncSession = Depends(get_db),
+        batch_repo: BatchRepository = Depends(get_batch_repository),
 ):
-    batch = await batch_repo.get_by_id(batch_id)
-    if not batch:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found"
-        )
-
-    from datetime import datetime
+    batch = await get_or_404(batch_repo, batch_id, "Batch not found")
 
     update_data = batch_update.model_dump(exclude_unset=True)
 
     if "is_closed" in update_data:
         if update_data["is_closed"] and not batch.is_closed:
-            update_data["closed_at"] = datetime.utcnow()
+            update_data["closed_at"] = datetime.now(timezone.utc)
         elif not update_data["is_closed"] and batch.is_closed:
             update_data["closed_at"] = None
 
@@ -155,16 +155,10 @@ async def update_batch(
 
 @router.post("/{batch_id}/aggregate", response_model=dict)
 async def aggregate_batch(
-    batch_id: int,
-    db: AsyncSession = Depends(get_db),
-    product_repo: ProductRepository = Depends(get_product_repository),
+        batch_id: int,
+        batch_repo: BatchRepository = Depends(get_batch_repository),
+        product_repo: ProductRepository = Depends(get_product_repository),
 ):
-    batch_repo = BatchRepository(db)
-    batch = await batch_repo.get_by_id(batch_id)
-    if not batch:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found"
-        )
-
+    batch = await get_or_404(batch_repo, batch_id, "Batch not found")
     stats = await product_repo.get_aggregation_stats(batch_id)
     return {"success": True, "batch_id": batch_id, "statistics": stats}

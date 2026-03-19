@@ -1,4 +1,4 @@
-from sqlalchemy import Index, String
+from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base, TimestampMixin
@@ -15,8 +15,4 @@ class WorkCenter(Base, PrimaryKeyMixin, TimestampMixin):
         "Batch",
         back_populates="work_center",
         lazy="select"
-    )
-
-    __table_args__ = (
-        Index("idx_work_center_identifier", "identifier"),
     )

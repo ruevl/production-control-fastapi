@@ -1,18 +1,17 @@
-import asyncio
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from src.celery_app import celery_app
 from src.core.config import settings
-from src.db.session import engine
+from src.db.session import sync_engine
 from src.models.batch import Batch
 from src.models.product import Product
 from src.models.work_center import WorkCenter
-from src.storage.minio_service import MinIOService
+from src.storage.minio_service import get_minio_service
 
 
 @celery_app.task(bind=True, max_retries=3)
@@ -22,77 +21,64 @@ def generate_batch_report(
         format: str = "excel",
         user_email: str | None = None
 ):
-    """
-    Генерация детального отчета по партии.
-    """
     try:
-        async def _generate():
-            async with AsyncSession(engine) as db:
-                # Get batch with products
-                batch_query = (
-                    select(Batch)
-                    .join(WorkCenter)
-                    .where(Batch.id == batch_id)
-                )
-                batch_result = await db.execute(batch_query)
-                batch = batch_result.scalar_one_or_none()
+        with Session(sync_engine) as db:
+            batch = db.execute(
+                select(Batch)
+                .join(WorkCenter)
+                .where(Batch.id == batch_id)
+            ).scalar_one_or_none()
 
-                if not batch:
-                    raise ValueError(f"Batch {batch_id} not found")
+            if not batch:
+                raise ValueError(f"Batch {batch_id} not found")
 
-                products_query = select(Product).where(Product.batch_id == batch_id)
-                products_result = await db.execute(products_query)
-                products = products_result.scalars().all()
+            products = db.execute(
+                select(Product).where(Product.batch_id == batch_id)
+            ).scalars().all()
 
-                # Generate report
-                with tempfile.NamedTemporaryFile(
-                        suffix=f".{format}",
-                        delete=False
-                ) as tmp_file:
-                    if format == "excel":
-                        _generate_excel_report(tmp_file.name, batch, products)
-                    elif format == "pdf":
-                        _generate_pdf_report(tmp_file.name, batch, products)
-                    else:
-                        raise ValueError(f"Unsupported format: {format}")
+        with tempfile.NamedTemporaryFile(suffix=f".{format}", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
 
-                    # Upload to MinIO
-                    minio_service = MinIOService()
-                    object_name = f"batch_{batch_id}_report.{format}"
-                    file_url = minio_service.upload_file(
-                        bucket=settings.minio_bucket_reports,
-                        file_path=tmp_file.name,
-                        object_name=object_name,
-                        expires_days=7
-                    )
+        try:
+            if format == "excel":
+                _generate_excel_report(tmp_path, batch, products)
+            elif format == "pdf":
+                _generate_pdf_report(tmp_path, batch, products)
+            else:
+                raise ValueError(f"Unsupported format: {format}")
 
-                    # Clean up temp file
-                    Path(tmp_file.name).unlink()
+            file_size = Path(tmp_path).stat().st_size
 
-                    return {
-                        "success": True,
-                        "file_url": file_url,
-                        "file_name": object_name,
-                        "file_size": Path(tmp_file.name).stat().st_size if Path(tmp_file.name).exists() else 0,
-                        "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat()
-                    }
+            minio_service = get_minio_service()
+            object_name = f"batch_{batch_id}_report.{format}"
+            file_url = minio_service.upload_file(
+                bucket=settings.minio_bucket_reports,
+                file_path=tmp_path,
+                object_name=object_name,
+            )
 
-        return asyncio.run(_generate())
+            return {
+                "success": True,
+                "file_url": file_url,
+                "file_name": object_name,
+                "file_size": file_size,
+                "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+            }
+
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     except Exception as exc:
         self.retry(exc=exc, countdown=60)
 
 
 def _generate_excel_report(file_path: str, batch, products):
-    """Generate Excel report."""
     from openpyxl import Workbook
 
     wb = Workbook()
 
-    # Sheet 1: Batch Info
     ws_info = wb.active
     ws_info.title = "Информация о партии"
-
     ws_info["A1"] = "Номер партии"
     ws_info["B1"] = batch.batch_number
     ws_info["A2"] = "Дата партии"
@@ -112,12 +98,11 @@ def _generate_excel_report(file_path: str, batch, products):
     ws_info["A9"] = "Окончание смены"
     ws_info["B9"] = str(batch.shift_end)
 
-    # Sheet 2: Products
     ws_products = wb.create_sheet("Продукция")
     ws_products["A1"] = "ID"
     ws_products["B1"] = "Уникальный код"
-    ws_products["C1"] = "Аггрегирована"
-    ws_products["D1"] = "Дата аггрегации"
+    ws_products["C1"] = "Агрегирована"
+    ws_products["D1"] = "Дата агрегации"
 
     for idx, product in enumerate(products, start=2):
         ws_products[f"A{idx}"] = product.id
@@ -125,14 +110,12 @@ def _generate_excel_report(file_path: str, batch, products):
         ws_products[f"C{idx}"] = "Да" if product.is_aggregated else "Нет"
         ws_products[f"D{idx}"] = str(product.aggregated_at) if product.aggregated_at else "-"
 
-    # Sheet 3: Statistics
     ws_stats = wb.create_sheet("Статистика")
     total = len(products)
     aggregated = sum(1 for p in products if p.is_aggregated)
-
     ws_stats["A1"] = "Всего продукции"
     ws_stats["B1"] = total
-    ws_stats["A2"] = "Аггрегировано"
+    ws_stats["A2"] = "Агрегировано"
     ws_stats["B2"] = aggregated
     ws_stats["A3"] = "Осталось"
     ws_stats["B3"] = total - aggregated
@@ -143,7 +126,6 @@ def _generate_excel_report(file_path: str, batch, products):
 
 
 def _generate_pdf_report(file_path: str, batch, products):
-    """Generate PDF report."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm
     from reportlab.pdfgen import canvas
@@ -151,11 +133,9 @@ def _generate_pdf_report(file_path: str, batch, products):
     c = canvas.Canvas(file_path, pagesize=A4)
     width, height = A4
 
-    # Title
     c.setFont("Helvetica-Bold", 20)
     c.drawString(2 * cm, height - 2 * cm, f"Отчет по партии {batch.batch_number}")
 
-    # Batch info
     c.setFont("Helvetica", 12)
     y_pos = height - 4 * cm
     c.drawString(2 * cm, y_pos, f"Дата: {batch.batch_date}")
@@ -168,7 +148,6 @@ def _generate_pdf_report(file_path: str, batch, products):
     y_pos -= 0.5 * cm
     c.drawString(2 * cm, y_pos, f"Номенклатура: {batch.nomenclature}")
 
-    # Products table
     y_pos -= 1 * cm
     c.setFont("Helvetica-Bold", 12)
     c.drawString(2 * cm, y_pos, "Продукция:")
@@ -177,16 +156,15 @@ def _generate_pdf_report(file_path: str, batch, products):
     y_pos -= 0.7 * cm
     c.drawString(2 * cm, y_pos, "Код")
     c.drawString(6 * cm, y_pos, "Статус")
-    c.drawString(10 * cm, y_pos, "Дата аггрегации")
+    c.drawString(10 * cm, y_pos, "Дата агрегации")
 
     y_pos -= 0.5 * cm
-    for product in products[:50]:  # Limit to 50 products per page
+    for product in products[:50]:
         if y_pos < 2 * cm:
             c.showPage()
             y_pos = height - 2 * cm
-
         c.drawString(2 * cm, y_pos, product.unique_code)
-        c.drawString(6 * cm, y_pos, "Аггрегирована" if product.is_aggregated else "Не аггрегирована")
+        c.drawString(6 * cm, y_pos, "Агрегирована" if product.is_aggregated else "Не агрегирована")
         c.drawString(10 * cm, y_pos, str(product.aggregated_at) if product.aggregated_at else "-")
         y_pos -= 0.5 * cm
 

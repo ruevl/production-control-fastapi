@@ -32,8 +32,11 @@ class BaseRepository(Generic[T]):
 
     async def update(self, instance: T, data: dict) -> T:
         for field, value in data.items():
-            if hasattr(instance, field) and value is not None:
-                setattr(instance, field, value)
+            if not hasattr(instance, field):
+                raise ValueError(
+                    f"Field '{field}' does not exist on {type(instance).__name__}"
+                )
+            setattr(instance, field, value)
         await self.db.flush()
         await self.db.refresh(instance)
         return instance

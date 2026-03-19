@@ -1,11 +1,10 @@
-import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from src.celery_app import celery_app
-from src.db.session import engine
+from src.db.session import sync_engine  # синхронный движок для Celery
 from src.models.batch import Batch
 from src.models.product import Product
 
@@ -18,71 +17,68 @@ def aggregate_products_batch(
         user_id: int | None = None
 ):
     """
-    Асинхронная массовая аггрегация продукции.
+    Массовая агрегация продукции.
+    Используем синхронный SQLAlchemy — без asyncio.run() внутри Celery.
     """
     try:
-        async def _aggregate():
-            async with AsyncSession(engine) as db:
-                batch_query = select(Batch).where(Batch.id == batch_id)
-                result = await db.execute(batch_query)
-                batch = result.scalar_one_or_none()
+        with Session(sync_engine) as db:
+            batch = db.execute(
+                select(Batch).where(Batch.id == batch_id)
+            ).scalar_one_or_none()
 
-                if not batch:
-                    raise ValueError(f"Batch {batch_id} not found")
+            if not batch:
+                raise ValueError(f"Batch {batch_id} not found")
 
-                total = len(unique_codes)
-                aggregated_count = 0
-                failed_count = 0
-                errors = []
+            total = len(unique_codes)
+            aggregated_count = 0
+            failed_count = 0
+            errors = []
 
-                for i, code in enumerate(unique_codes):
-                    try:
-                        product_query = select(Product).where(
+            for i, code in enumerate(unique_codes):
+                try:
+                    product = db.execute(
+                        select(Product).where(
                             Product.unique_code == code,
                             Product.batch_id == batch_id
                         )
-                        product_result = await db.execute(product_query)
-                        product = product_result.scalar_one_or_none()
+                    ).scalar_one_or_none()
 
-                        if not product:
-                            errors.append({"code": code, "reason": "Product not found"})
-                            failed_count += 1
-                            continue
-
-                        if product.is_aggregated:
-                            errors.append({"code": code, "reason": "Already aggregated"})
-                            failed_count += 1
-                            continue
-
-                        product.is_aggregated = True
-                        product.aggregated_at = datetime.utcnow()
-                        aggregated_count += 1
-
-                        # Update progress
-                        self.update_state(
-                            state="PROGRESS",
-                            meta={
-                                "current": i + 1,
-                                "total": total,
-                                "progress": int((i + 1) / total * 100)
-                            }
-                        )
-
-                    except Exception as e:
-                        errors.append({"code": code, "reason": str(e)})
+                    if not product:
+                        errors.append({"code": code, "reason": "Product not found"})
                         failed_count += 1
+                        continue
 
-                await db.commit()
+                    if product.is_aggregated:
+                        errors.append({"code": code, "reason": "Already aggregated"})
+                        failed_count += 1
+                        continue
 
-                return {
-                    "success": True,
-                    "total": total,
-                    "aggregated": aggregated_count,
-                    "failed": failed_count,
-                    "errors": errors
-                }
+                    product.is_aggregated = True
+                    product.aggregated_at = datetime.now(timezone.utc)  # fix #20
+                    aggregated_count += 1
 
-        return asyncio.run(_aggregate())
+                    self.update_state(
+                        state="PROGRESS",
+                        meta={
+                            "current": i + 1,
+                            "total": total,
+                            "progress": int((i + 1) / total * 100)
+                        }
+                    )
+
+                except Exception as e:
+                    errors.append({"code": code, "reason": str(e)})
+                    failed_count += 1
+
+            db.commit()
+
+            return {
+                "success": True,
+                "total": total,
+                "aggregated": aggregated_count,
+                "failed": failed_count,
+                "errors": errors
+            }
 
     except Exception as exc:
         self.retry(exc=exc, countdown=60)

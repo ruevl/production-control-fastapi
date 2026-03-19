@@ -1,8 +1,8 @@
-"""Тесты для health check и root endpoints."""
+import pytest
 
 
+@pytest.mark.asyncio
 async def test_health_check(client):
-    """Тест эндпоинта /health."""
     response = await client.get("/health")
     assert response.status_code == 200
     data = response.json()
@@ -10,8 +10,8 @@ async def test_health_check(client):
     assert data["service"] == "production-control"
 
 
+@pytest.mark.asyncio
 async def test_root(client):
-    """Тест корневого эндпоинта /."""
     response = await client.get("/")
     assert response.status_code == 200
     data = response.json()

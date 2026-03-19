@@ -1,126 +1,100 @@
-import asyncio
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session, selectinload
 
 from src.celery_app import celery_app
 from src.core.config import settings
-from src.db.session import engine
+from src.db.session import sync_engine
 from src.models.batch import Batch
 from src.models.work_center import WorkCenter
-from src.storage.minio_service import MinIOService
+from src.storage.minio_service import get_minio_service
 
 
 @celery_app.task(bind=True, max_retries=1)
-def import_batches_from_file(
-        self,
-        file_url: str,
-        user_id: int
-):
-    """
-    Импорт партий из Excel/CSV файла.
-    """
+def import_batches_from_file(self, file_url: str, user_id: int):
     try:
-        # Download file from MinIO
-        minio_service = MinIOService()
+        minio_service = get_minio_service()
+
         with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+
+        try:
             minio_service.download_file(
                 bucket=settings.minio_bucket_imports,
                 object_name=file_url.split("/")[-1],
-                file_path=tmp_file.name
+                file_path=tmp_path
             )
 
-            # Process file
-            total_rows = 0
+            import pandas as pd
+
+            df = pd.read_excel(tmp_path)
+            total_rows = len(df)
             created = 0
             skipped = 0
             errors = []
 
-            async def _import():
-                nonlocal total_rows, created, skipped, errors
-
-                async with AsyncSession(engine) as db:
-                    import pandas as pd
-
-                    df = pd.read_excel(tmp_file.name)
-                    total_rows = len(df)
-
-                    for idx, row in df.iterrows():
-                        try:
-                            # Check for duplicate
-                            existing = await db.execute(
-                                select(Batch).where(
-                                    Batch.batch_number == row["НомерПартии"],
-                                    Batch.batch_date == row["ДатаПартии"]
-                                )
+            with Session(sync_engine) as db:
+                for idx, row in df.iterrows():
+                    try:
+                        existing = db.execute(
+                            select(Batch).where(
+                                Batch.batch_number == row["НомерПартии"],
+                                Batch.batch_date == row["ДатаПартии"]
                             )
-                            if existing.scalar_one_or_none():
-                                errors.append({
-                                    "row": idx + 2,
-                                    "error": "Duplicate batch number and date"
-                                })
-                                skipped += 1
-                                continue
+                        ).scalar_one_or_none()
 
-                            # Get or create work center
-                            wc_result = await db.execute(
-                                select(WorkCenter).where(
-                                    WorkCenter.identifier == row["ИдентификаторРЦ"]
-                                )
+                        if existing:
+                            errors.append({"row": idx + 2, "error": "Duplicate batch"})
+                            skipped += 1
+                            continue
+
+                        work_center = db.execute(
+                            select(WorkCenter).where(
+                                WorkCenter.identifier == row["ИдентификаторРЦ"]
                             )
-                            work_center = wc_result.scalar_one_or_none()
+                        ).scalar_one_or_none()
 
-                            if not work_center:
-                                errors.append({
-                                    "row": idx + 2,
-                                    "error": f"Work center '{row['ИдентификаторРЦ']}' not found"
-                                })
-                                skipped += 1
-                                continue
-
-                            # Create batch
-                            batch = Batch(
-                                task_description=row["ПредставлениеЗаданияНаСмену"],
-                                work_center_id=work_center.id,
-                                shift=row["Смена"],
-                                team=row["Бригада"],
-                                batch_number=row["НомерПартии"],
-                                batch_date=row["ДатаПартии"],
-                                nomenclature=row["Номенклатура"],
-                                ekn_code=row["КодЕКН"],
-                                shift_start=row["ДатаВремяНачалаСмены"],
-                                shift_end=row["ДатаВремяОкончанияСмены"],
-                            )
-                            db.add(batch)
-                            created += 1
-
-                            # Update progress
-                            self.update_state(
-                                state="PROGRESS",
-                                meta={
-                                    "current": idx + 1,
-                                    "total": total_rows,
-                                    "created": created,
-                                    "skipped": skipped
-                                }
-                            )
-
-                        except Exception as e:
+                        if not work_center:
                             errors.append({
                                 "row": idx + 2,
-                                "error": str(e)
+                                "error": f"Work center '{row['ИдентификаторРЦ']}' not found"
                             })
                             skipped += 1
+                            continue
 
-                    await db.commit()
+                        batch = Batch(
+                            task_description=row["ПредставлениеЗаданияНаСмену"],
+                            work_center_id=work_center.id,
+                            shift=row["Смена"],
+                            team=row["Бригада"],
+                            batch_number=row["НомерПартии"],
+                            batch_date=row["ДатаПартии"],
+                            nomenclature=row["Номенклатура"],
+                            ekn_code=row["КодЕКН"],
+                            shift_start=row["ДатаВремяНачалаСмены"],
+                            shift_end=row["ДатаВремяОкончанияСмены"],
+                        )
+                        db.add(batch)
+                        created += 1
 
-            asyncio.run(_import())
+                        self.update_state(
+                            state="PROGRESS",
+                            meta={
+                                "current": idx + 1,
+                                "total": total_rows,
+                                "created": created,
+                                "skipped": skipped
+                            }
+                        )
 
-            # Clean up
-            Path(tmp_file.name).unlink()
+                    except Exception as e:
+                        errors.append({"row": idx + 2, "error": str(e)})
+                        skipped += 1
+
+                db.commit()
 
             return {
                 "success": True,
@@ -130,77 +104,67 @@ def import_batches_from_file(
                 "errors": errors
             }
 
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
     except Exception as exc:
         self.retry(exc=exc, countdown=300)
 
 
 @celery_app.task
-def export_batches_to_file(
-        filters: dict,
-        format: str = "excel"
-):
-    """
-    Экспорт списка партий в файл.
-    """
+def export_batches_to_file(filters: dict, format: str = "excel"):
     import pandas as pd
-    from sqlalchemy.ext.asyncio import AsyncSession
 
-    async def _export():
-        async with AsyncSession(engine) as db:
-            query = select(Batch)
+    with Session(sync_engine) as db:
+        query = select(Batch).options(selectinload(Batch.work_center))
 
-            if "is_closed" in filters:
-                query = query.where(Batch.is_closed == filters["is_closed"])
-            if "date_from" in filters:
-                query = query.where(Batch.batch_date >= filters["date_from"])
-            if "date_to" in filters:
-                query = query.where(Batch.batch_date <= filters["date_to"])
+        if "is_closed" in filters:
+            query = query.where(Batch.is_closed == filters["is_closed"])
+        if "date_from" in filters:
+            query = query.where(Batch.batch_date >= filters["date_from"])
+        if "date_to" in filters:
+            query = query.where(Batch.batch_date <= filters["date_to"])
 
-            result = await db.execute(query)
-            batches = result.scalars().all()
+        batches = db.execute(query).scalars().all()
 
-            # Convert to DataFrame
-            data = []
-            for batch in batches:
-                data.append({
-                    "ID": batch.id,
-                    "НомерПартии": batch.batch_number,
-                    "ДатаПартии": str(batch.batch_date),
-                    "Номенклатура": batch.nomenclature,
-                    "РабочийЦентр": batch.work_center.name if batch.work_center else "",
-                    "Смена": batch.shift,
-                    "Бригада": batch.team,
-                    "Статус": "Закрыта" if batch.is_closed else "Открыта",
-                })
+        data = []
+        for batch in batches:
+            data.append({
+                "ID": batch.id,
+                "НомерПартии": batch.batch_number,
+                "ДатаПартии": str(batch.batch_date),
+                "Номенклатура": batch.nomenclature,
+                "РабочийЦентр": batch.work_center.name if batch.work_center else "",
+                "Смена": batch.shift,
+                "Бригада": batch.team,
+                "Статус": "Закрыта" if batch.is_closed else "Открыта",
+            })
 
-            df = pd.DataFrame(data)
+        df = pd.DataFrame(data)
 
-            # Save to file
-            with tempfile.NamedTemporaryFile(
-                    suffix=f".{format}",
-                    delete=False
-            ) as tmp_file:
-                if format == "excel":
-                    df.to_excel(tmp_file.name, index=False)
-                elif format == "csv":
-                    df.to_csv(tmp_file.name, index=False)
+        suffix = ".xlsx" if format == "excel" else f".{format}"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
+            tmp_path = tmp_file.name
 
-                # Upload to MinIO
-                minio_service = MinIOService()
-                object_name = f"batches_export_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.{format}"
-                file_url = minio_service.upload_file(
-                    bucket=settings.minio_bucket_exports,
-                    file_path=tmp_file.name,
-                    object_name=object_name,
-                    expires_days=7
-                )
+        try:
+            if format == "excel":
+                df.to_excel(tmp_path, index=False)
+            elif format == "csv":
+                df.to_csv(tmp_path, index=False)
 
-                Path(tmp_file.name).unlink()
+            minio_service = get_minio_service()
+            object_name = f"batches_export_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.{format}"
+            file_url = minio_service.upload_file(
+                bucket=settings.minio_bucket_exports,
+                file_path=tmp_path,
+                object_name=object_name,
+            )
 
-                return {
-                    "success": True,
-                    "file_url": file_url,
-                    "total_batches": len(batches)
-                }
+            return {
+                "success": True,
+                "file_url": file_url,
+                "total_batches": len(batches)
+            }
 
-    return asyncio.run(_export())
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)

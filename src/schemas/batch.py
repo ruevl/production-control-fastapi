@@ -4,18 +4,31 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class OneCFields:
+    TASK_DESCRIPTION = "ПредставлениеЗаданияНаСмену"
+    WORK_CENTER_ID = "ИдентификаторРЦ"
+    SHIFT = "Смена"
+    TEAM = "Бригада"
+    BATCH_NUMBER = "НомерПартии"
+    BATCH_DATE = "ДатаПартии"
+    NOMENCLATURE = "Номенклатура"
+    EKN_CODE = "КодЕКН"
+    SHIFT_START = "ДатаВремяНачалаСмены"
+    SHIFT_END = "ДатаВремяОкончанияСмены"
+
+
 class BatchCreate(BaseModel):
     is_closed: bool = False
-    task_description: str = Field(..., alias="ПредставлениеЗаданияНаСмену")
-    work_center_identifier: str = Field(..., alias="ИдентификаторРЦ")
-    shift: str = Field(..., alias="Смена")
-    team: str = Field(..., alias="Бригада")
-    batch_number: int = Field(..., alias="НомерПартии")
-    batch_date: date = Field(..., alias="ДатаПартии")
-    nomenclature: str = Field(..., alias="Номенклатура")
-    ekn_code: str = Field(..., alias="КодЕКН")
-    shift_start: datetime = Field(..., alias="ДатаВремяНачалаСмены")
-    shift_end: datetime = Field(..., alias="ДатаВремяОкончанияСмены")
+    task_description: str = Field(..., alias=OneCFields.TASK_DESCRIPTION)
+    work_center_identifier: str = Field(..., alias=OneCFields.WORK_CENTER_ID)
+    shift: str = Field(..., alias=OneCFields.SHIFT)
+    team: str = Field(..., alias=OneCFields.TEAM)
+    batch_number: int = Field(..., alias=OneCFields.BATCH_NUMBER)
+    batch_date: date = Field(..., alias=OneCFields.BATCH_DATE)
+    nomenclature: str = Field(..., alias=OneCFields.NOMENCLATURE)
+    ekn_code: str = Field(..., alias=OneCFields.EKN_CODE)
+    shift_start: datetime = Field(..., alias=OneCFields.SHIFT_START)
+    shift_end: datetime = Field(..., alias=OneCFields.SHIFT_END)
 
     class Config:
         populate_by_name = True

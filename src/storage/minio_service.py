@@ -1,23 +1,29 @@
 from datetime import timedelta
+from functools import lru_cache
 
 from minio import Minio
 from minio.error import S3Error
 
-from src.core.config import settings
+from src.core.config import Settings, get_settings
 
 
 class MinIOService:
+    def __init__(self, settings: Settings):
+        self._settings = settings
+        self._client: Minio | None = None
 
-    def __init__(self):
-        self.client = Minio(
-            settings.minio_endpoint,
-            access_key=settings.minio_access_key,
-            secret_key=settings.minio_secret_key,
-            secure=settings.minio_secure
-        )
+    @property
+    def client(self) -> Minio:
+        if self._client is None:
+            self._client = Minio(
+                self._settings.minio_endpoint,
+                access_key=self._settings.minio_access_key,
+                secret_key=self._settings.minio_secret_key,
+                secure=self._settings.minio_secure,
+            )
+        return self._client
 
     def _ensure_bucket(self, bucket_name: str) -> None:
-        """Создаёт бакет, если он не существует."""
         if not self.client.bucket_exists(bucket_name):
             self.client.make_bucket(bucket_name)
 
@@ -29,7 +35,6 @@ class MinIOService:
             content_type: str = "application/octet-stream"
     ) -> str:
         self._ensure_bucket(bucket)
-
         try:
             self.client.fput_object(
                 bucket_name=bucket,
@@ -37,7 +42,7 @@ class MinIOService:
                 file_path=file_path,
                 content_type=content_type
             )
-            return f"http://{settings.minio_endpoint}/{bucket}/{object_name}"
+            return f"http://{self._settings.minio_endpoint}/{bucket}/{object_name}"
         except S3Error as e:
             raise Exception(f"Failed to upload file: {e}") from e
 
@@ -93,4 +98,6 @@ class MinIOService:
             return False
 
 
-minio_service = MinIOService()
+@lru_cache
+def get_minio_service() -> MinIOService:
+    return MinIOService(get_settings())
